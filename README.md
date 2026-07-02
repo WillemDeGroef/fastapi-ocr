@@ -1,4 +1,4 @@
-# ocr-service
+# FastAPI OCR service for PP-OCRv6 (PaddleOCR)
 
 FastAPI service that turns a PDF upload into OCR'd plaintext using PaddleOCR's
 [**PP-OCRv6**](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_det_safetensors)
