@@ -1,7 +1,8 @@
 # ocr-service
 
-FastAPI service that turns a PDF upload into OCR'd plaintext using PaddleOCR
-behind an asyncio queue.
+FastAPI service that turns a PDF upload into OCR'd plaintext using PaddleOCR's
+[**PP-OCRv6**](https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_det_safetensors)
+models behind an asyncio queue.
 
 ```
 POST /jobs           multipart PDF   → { job_id, status: "queued", ... }
@@ -17,6 +18,55 @@ Run:
 ```bash
 uv run uvicorn server:app --host 0.0.0.0 --port 8000
 ```
+
+---
+
+## OCR model: PP-OCRv6
+
+The service ships with **PP-OCRv6** as its default OCR engine (the `apple`
+profile — see [Runtime profiles](#runtime-profiles-ocr_profile) below). PP-OCRv6
+is the PaddleOCR team's 2025 model family, tagged *"From 1.5M to 34.5M
+Parameters, Surpassing Billion-Scale VLMs on OCR Tasks."*
+
+Why it's the default here:
+
+- **Accuracy.** `PP-OCRv6_medium` reaches **86.2 % detection Hmean** and
+  **83.2 % recognition accuracy**, beating the previous-generation
+  `PP-OCRv5_server` by **+4.6 %** / **+5.1 %** respectively — while staying
+  small enough to run on CPU. On the benchmark it edges out billion-parameter
+  VLMs (Qwen3-VL-235B, GPT-5.5, Gemini-3.1-Pro) on OCR tasks with orders of
+  magnitude fewer parameters.
+- **A scalable family.** Three tiers span 1.5M → 34.5M parameters. This repo
+  uses the **medium** detection (15.5M params) and recognition models, which
+  hit the accuracy/latency sweet spot for invoice-style documents.
+- **Modern lightweight architecture.** LCNetV4 backbone (MetaFormer-style with
+  structural reparameterization), a RepLKFPN detection neck, and an
+  EncoderWithLightSVTR recognition neck with local-global attention.
+- **Broad coverage.** 48 languages plus tricky scenes — handwritten, printed,
+  rotated, curved, blurred, artistic, and industrial text (digital displays,
+  dot-matrix, tire prints, …).
+
+The models are pulled from Hugging Face in **safetensors** format and run
+through the `transformers` engine (`OCR_ENGINE=transformers`, the default), so
+no `paddlepaddle` install is required. Model selection lives in one place —
+the `PROFILES` table in [`ocr_service.py`](ocr_service.py) — and is wired into
+every entry point (server, worker, and `convert_cli.py`) via `create_ocr_fn()`:
+
+```python
+PaddleOCR(
+    text_detection_model_name="PP-OCRv6_medium_det",
+    text_recognition_model_name="PP-OCRv6_medium_rec",
+    engine="transformers",
+    ...
+)
+```
+
+Older x86_64 CPUs without AVX2 can fall back to the lighter PP-OCRv5 mobile
+models via `OCR_PROFILE=legacy-cpu` — see
+[Runtime profiles](#runtime-profiles-ocr_profile). Requires `paddleocr>=3.7.0`
+and a `transformers` + `torch` environment (both already pinned in
+`pyproject.toml`). Model card:
+<https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_det_safetensors>.
 
 ---
 
