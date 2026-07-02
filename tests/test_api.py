@@ -114,6 +114,142 @@ def test_restart_rehydrates_orphaned_jobs(data_dir: Path, sample_pdf: bytes, fak
         assert Path(body["result_path"]).exists()
 
 
+def test_upload_exceeding_max_bytes_is_rejected_and_leaves_no_partial(
+    data_dir: Path, fake_ocr
+):
+    """Oversized uploads must be refused before they fill memory or disk."""
+    from fastapi.testclient import TestClient
+
+    from ocr_api import create_app
+
+    app = create_app(data_dir=data_dir, ocr_fn=fake_ocr, max_upload_bytes=1024)
+    with TestClient(app) as c:
+        oversized = b"%PDF-1.4\n" + b"0" * 4096
+        r = c.post(
+            "/jobs",
+            files={"file": ("big.pdf", oversized, "application/pdf")},
+        )
+        assert r.status_code == 413, r.text
+        # No partial upload and no job record should survive a rejected upload.
+        assert list((data_dir / "uploads").glob("*.pdf")) == []
+        assert list((data_dir / "jobs").glob("*.json")) == []
+
+
+def test_auth_required_when_token_configured(data_dir: Path, sample_pdf: bytes, fake_ocr):
+    """With an api_token set, /jobs must reject unauthenticated and wrong-token callers."""
+    from fastapi.testclient import TestClient
+
+    from ocr_api import create_app
+
+    app = create_app(data_dir=data_dir, ocr_fn=fake_ocr, api_token="s3cret")
+    with TestClient(app) as c:
+        files = {"file": ("invoice.pdf", sample_pdf, "application/pdf")}
+
+        # No credentials.
+        assert c.post("/jobs", files=files).status_code == 401
+        # Wrong token.
+        r = c.post(
+            "/jobs", files=files, headers={"Authorization": "Bearer nope"}
+        )
+        assert r.status_code == 401
+        # Correct token.
+        r = c.post(
+            "/jobs", files=files, headers={"Authorization": "Bearer s3cret"}
+        )
+        assert r.status_code == 202, r.text
+
+
+def test_upload_rejected_when_queue_full_and_leaves_no_partial(
+    data_dir: Path, sample_pdf: bytes
+):
+    """A full queue must shed load with 503, not grow memory/disk without bound."""
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from ocr_api import create_app
+
+    gate = threading.Event()
+
+    def blocking_ocr(pdf_path: Path) -> str:
+        gate.wait(timeout=5.0)
+        return "done"
+
+    # maxsize=1: first job is pulled by the worker and blocks, second fills the
+    # queue, third must be rejected.
+    app = create_app(
+        data_dir=data_dir, ocr_fn=blocking_ocr, max_queue_size=1
+    )
+    with TestClient(app) as c:
+        accepted = 0
+        rejected = None
+        for _ in range(5):
+            r = c.post(
+                "/jobs",
+                files={"file": ("invoice.pdf", sample_pdf, "application/pdf")},
+            )
+            if r.status_code == 202:
+                accepted += 1
+            else:
+                rejected = r
+                break
+        assert rejected is not None, "expected the queue to reject an upload"
+        assert rejected.status_code == 503, rejected.text
+        # The rejected upload must not leave an orphan file or job record behind.
+        uploads = list((data_dir / "uploads").glob("*.pdf"))
+        jobs = list((data_dir / "jobs").glob("*.json"))
+        assert len(uploads) == accepted
+        assert len(jobs) == accepted
+        gate.set()
+
+
+def test_concurrent_rehydration_processes_orphan_exactly_once(
+    data_dir: Path, sample_pdf: bytes
+):
+    """Two processes sharing a data dir must not both re-run the same orphan job."""
+    import json
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from ocr_api import create_app
+
+    jobs_dir = data_dir / "jobs"
+    uploads_dir = data_dir / "uploads"
+    for d in (jobs_dir, uploads_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    orphan_id = "orphan-shared"
+    pdf_path = uploads_dir / f"{orphan_id}.pdf"
+    pdf_path.write_bytes(sample_pdf)
+    (jobs_dir / f"{orphan_id}.json").write_text(
+        json.dumps(
+            {"job_id": orphan_id, "status": "running", "pdf_path": str(pdf_path)}
+        )
+    )
+
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+    gate = threading.Event()
+
+    def gated_counting_ocr(p: Path) -> str:
+        with calls_lock:
+            calls.append(p.name)
+        gate.wait(timeout=5.0)
+        return f"OCR[{p.name}]"
+
+    app_a = create_app(data_dir=data_dir, ocr_fn=gated_counting_ocr)
+    app_b = create_app(data_dir=data_dir, ocr_fn=gated_counting_ocr)
+    # app_a claims the orphan during its startup and holds the claim while it
+    # processes; app_b's startup must find it already claimed and skip it.
+    with TestClient(app_a) as ca, TestClient(app_b):
+        gate.set()
+        body = _wait_for_status(ca, orphan_id, "completed")
+        assert body["status"] == "completed"
+
+    assert calls == [f"{orphan_id}.pdf"], f"orphan processed more than once: {calls}"
+
+
 def test_get_result_returns_409_if_not_completed(data_dir: Path, sample_pdf: bytes):
     """When the worker is blocked, /result must not silently 404 or 200 with empty text."""
     import threading
