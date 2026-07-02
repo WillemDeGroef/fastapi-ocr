@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -11,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 import structlog
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
 
 OcrFn = Callable[[Path], str]
@@ -34,8 +37,38 @@ def _read_job(jobs_dir: Path, job_id: str) -> dict | None:
     return json.loads(path.read_text())
 
 
+def _acquire_claim(locks_dir: Path, job_id: str) -> int | None:
+    """Atomically claim a job across processes with an exclusive advisory lock.
+
+    Returns an open file descriptor on success (the caller must hold it for the
+    job's lifetime and release it via ``_release_claim``), or ``None`` when
+    another live process already owns the job. The OS drops the lock if the
+    owning process dies, so a job left ``running`` by a crash is reclaimable.
+    """
+    fd = os.open(locks_dir / f"{job_id}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_claim(locks_dir: Path, job_id: str, fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    (locks_dir / f"{job_id}.lock").unlink(missing_ok=True)
+
+
 async def _run_worker(
-    queue: asyncio.Queue, jobs_dir: Path, results_dir: Path, ocr_fn: OcrFn
+    queue: asyncio.Queue,
+    jobs_dir: Path,
+    results_dir: Path,
+    ocr_fn: OcrFn,
+    claims: dict[str, int],
+    locks_dir: Path,
 ) -> None:
     log.info("worker.started")
     while True:
@@ -67,20 +100,35 @@ async def _run_worker(
                 error=repr(exc),
             )
         finally:
+            fd = claims.pop(job_id, None)
+            if fd is not None:
+                _release_claim(locks_dir, job_id, fd)
             structlog.contextvars.unbind_contextvars("job_id")
             queue.task_done()
 
 
-def create_app(*, data_dir: Path, ocr_fn: OcrFn) -> FastAPI:
+_UPLOAD_CHUNK = 1 << 20  # 1 MiB
+
+
+def create_app(
+    *,
+    data_dir: Path,
+    ocr_fn: OcrFn,
+    max_upload_bytes: int = 25 * 1024 * 1024,
+    max_queue_size: int = 100,
+    api_token: str | None = None,
+) -> FastAPI:
     uploads_dir = data_dir / "uploads"
     jobs_dir = data_dir / "jobs"
     results_dir = data_dir / "results"
-    for d in (uploads_dir, jobs_dir, results_dir):
+    locks_dir = data_dir / "locks"
+    for d in (uploads_dir, jobs_dir, results_dir, locks_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.queue = asyncio.Queue()
+        app.state.queue = asyncio.Queue(maxsize=max_queue_size)
+        app.state.claims = {}
         rehydrated = 0
         for path in sorted(jobs_dir.glob("*.json")):
             try:
@@ -90,8 +138,18 @@ def create_app(*, data_dir: Path, ocr_fn: OcrFn) -> FastAPI:
                 continue
             if record.get("status") in {"queued", "running"}:
                 job_id = record.get("job_id") or path.stem
+                fd = _acquire_claim(locks_dir, job_id)
+                if fd is None:
+                    log.info("job.rehydrate.already_claimed", job_id=job_id)
+                    continue
+                try:
+                    app.state.queue.put_nowait(job_id)
+                except asyncio.QueueFull:
+                    _release_claim(locks_dir, job_id, fd)
+                    log.warning("job.rehydrate.queue_full", job_id=job_id)
+                    break
                 _write_job(jobs_dir, job_id, status="queued")
-                app.state.queue.put_nowait(job_id)
+                app.state.claims[job_id] = fd
                 rehydrated += 1
                 log.info(
                     "job.rehydrated",
@@ -100,7 +158,14 @@ def create_app(*, data_dir: Path, ocr_fn: OcrFn) -> FastAPI:
                 )
         log.info("app.startup", data_dir=str(data_dir), rehydrated_jobs=rehydrated)
         app.state.worker = asyncio.create_task(
-            _run_worker(app.state.queue, jobs_dir, results_dir, ocr_fn)
+            _run_worker(
+                app.state.queue,
+                jobs_dir,
+                results_dir,
+                ocr_fn,
+                app.state.claims,
+                locks_dir,
+            )
         )
         try:
             yield
@@ -112,7 +177,21 @@ def create_app(*, data_dir: Path, ocr_fn: OcrFn) -> FastAPI:
             except asyncio.CancelledError:
                 pass
 
-    app = FastAPI(lifespan=lifespan)
+    async def require_auth(authorization: str | None = Header(default=None)) -> None:
+        """Enforce a bearer token when one is configured; a no-op otherwise."""
+        if api_token is None:
+            return
+        expected = f"Bearer {api_token}"
+        if authorization is None or not secrets.compare_digest(
+            authorization, expected
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid or missing bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    app = FastAPI(lifespan=lifespan, dependencies=[Depends(require_auth)])
 
     @app.post("/jobs", status_code=202)
     async def create_job(file: UploadFile = File(...)) -> dict:
@@ -122,14 +201,56 @@ def create_app(*, data_dir: Path, ocr_fn: OcrFn) -> FastAPI:
             )
         job_id = uuid.uuid4().hex
         pdf_path = uploads_dir / f"{job_id}.pdf"
-        contents = await file.read()
-        pdf_path.write_bytes(contents)
+        # Stream to disk in bounded chunks so a hostile upload can never buffer
+        # more than one chunk in memory, and abort the moment it exceeds the cap.
+        written = 0
+        try:
+            with pdf_path.open("wb") as out:
+                while chunk := await file.read(_UPLOAD_CHUNK):
+                    written += len(chunk)
+                    if written > max_upload_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"upload exceeds {max_upload_bytes} bytes",
+                        )
+                    out.write(chunk)
+        except HTTPException:
+            pdf_path.unlink(missing_ok=True)
+            log.warning(
+                "job.rejected.too_large",
+                filename=file.filename,
+                max_upload_bytes=max_upload_bytes,
+            )
+            raise
         record = _write_job(jobs_dir, job_id, status="queued", pdf_path=str(pdf_path))
-        await app.state.queue.put(job_id)
+        # Claim the job before enqueueing so the worker holds exclusive ownership
+        # for its whole lifetime (a fresh id is never contended, but this keeps a
+        # single claim/release path shared with rehydration).
+        fd = _acquire_claim(locks_dir, job_id)
+        try:
+            if fd is None:
+                raise HTTPException(status_code=503, detail="server busy, retry later")
+            app.state.queue.put_nowait(job_id)
+        except (asyncio.QueueFull, HTTPException) as exc:
+            if fd is not None:
+                _release_claim(locks_dir, job_id, fd)
+            pdf_path.unlink(missing_ok=True)
+            (jobs_dir / f"{job_id}.json").unlink(missing_ok=True)
+            log.warning(
+                "job.rejected.queue_full",
+                filename=file.filename,
+                max_queue_size=max_queue_size,
+            )
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(
+                status_code=503, detail="server busy, retry later"
+            ) from None
+        app.state.claims[job_id] = fd
         log.info(
             "job.queued",
             job_id=job_id,
-            pdf_bytes=len(contents),
+            pdf_bytes=written,
             filename=file.filename,
             queue_depth=app.state.queue.qsize(),
         )

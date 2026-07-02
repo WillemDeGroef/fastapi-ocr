@@ -21,6 +21,34 @@ uv run uvicorn server:app --host 0.0.0.0 --port 8000
 
 ---
 
+## Deployment & limits
+
+The service binds `0.0.0.0`, so treat `/jobs` as a trust boundary and put
+admission controls in front of the OCR workload. All are configured via env
+vars (read in [`server.py`](server.py)) and default to safe values:
+
+| Env var             | Default    | Purpose                                                              |
+| ------------------- | ---------- | -------------------------------------------------------------------- |
+| `API_TOKEN`         | *(unset)*  | When set, every request must send `Authorization: Bearer <token>`. Unset = open (dev only). |
+| `MAX_UPLOAD_BYTES`  | `26214400` | Uploads are streamed to disk in 1 MiB chunks and rejected with `413` once they exceed this cap — a hostile upload never buffers more than one chunk in memory. |
+| `MAX_QUEUE_SIZE`    | `100`      | Bounded in-memory job queue; a full queue sheds load with `503` instead of growing without bound. |
+| `DATA_DIR`          | `./data`   | Root for `uploads/`, `jobs/`, `results/`, `locks/`.                  |
+
+**Multi-worker safety.** Each `uvicorn` worker owns an independent in-memory
+queue. To keep the documented `--workers N` mode safe, every job is claimed
+with an exclusive `flock` on `./data/locks/<job_id>.lock` that is held for the
+job's whole lifetime. Startup rehydration only re-enqueues a `queued`/`running`
+job if it can acquire that lock, so **only one worker can process a given job**;
+duplicates and concurrent writes to the same result file are prevented. The OS
+releases the lock if a worker dies mid-job, so a crashed job is still reclaimed
+on the next startup. This relies on POSIX `flock` semantics on a **local
+filesystem** — do not point `DATA_DIR` at NFS/SMB, where `flock` is unreliable.
+
+Uploads are still validated only by `.pdf` suffix; add content/header
+validation upstream if callers are untrusted.
+
+---
+
 ## OCR model: PP-OCRv6
 
 The service ships with **PP-OCRv6** as its default OCR engine (the `apple`
