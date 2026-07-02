@@ -1,0 +1,42 @@
+[project]
+name = "paddleocrtest"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "paddleocr>=3.7.0",
+    "pymupdf>=1.24.0",
+    "torch>=2.12.1",
+    "torchvision>=0.27.1",
+    "transformers>=5.12.1",
+    "fastapi>=0.115.0",
+    "python-multipart>=0.0.9",
+    "uvicorn[standard]>=0.32.0",
+    "structlog>=24.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.28.0",
+]
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
